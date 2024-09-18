@@ -2,13 +2,16 @@
 using Microsoft.Azure.Cosmos;
 using Newtonsoft.Json;
 using System.Net;
+using System.Threading.Channels;
+using Spectre.Console;
+using Color = System.Drawing.Color;
 
 namespace Cosmos_Patterns_GlobalLock
 {
     /// <summary>
     /// This represents a lock in the Cosmos DB.  Also used as the target of the lock.
     /// </summary>
-    public class DistributedLock 
+    public class DistributedLock
     {
         [JsonProperty("id")]
         public string LockName { get; set; } //Lock Name
@@ -18,7 +21,7 @@ namespace Cosmos_Patterns_GlobalLock
 
         [JsonProperty("_ts")]
         public long Ts { get; set; }
-        
+
         public string OwnerId { get; set; } //ownerId, ClientId
 
         public long FenceToken { get; set; } //Incrementing token
@@ -34,18 +37,23 @@ namespace Cosmos_Patterns_GlobalLock
 
         [JsonProperty("_ts")]
         public long Ts { get; set; }
-
     }
 
     public class LockManager : IDisposable
     {
         DistributedLockService dls;
-        
+
         string lockName;
         public string ownerId;
         public string Name;
 
         public string leaseOwnerId;
+
+        private Task renewalTask;
+
+        private Channel<int> latestFenceToken = Channel.CreateUnbounded<int>();
+
+        private CancellationTokenSource renewalTokenSource = new CancellationTokenSource();
 
         /// <summary>
         /// This creates a container that has the TTL feature enabled.
@@ -55,16 +63,15 @@ namespace Cosmos_Patterns_GlobalLock
         /// <param name="lockContainerName"></param>
         /// <param name="lockName"></param>
         /// <param name="refreshIntervalS"></param>
-        public LockManager( DistributedLockService dls, string lockName, string threadName)
+        public LockManager(DistributedLockService dls, string lockName, string threadName)
         {
             this.dls = dls;
-            
+
             this.lockName = lockName;
-            
+
             this.ownerId = Guid.NewGuid().ToString();
 
             this.Name = threadName;
-
         }
 
         /// <summary>
@@ -77,7 +84,76 @@ namespace Cosmos_Patterns_GlobalLock
         /// <returns></returns>
         static public async Task<LockManager> CreateLockAsync(DistributedLockService dls, string lockName, string threadName)
         {
-            return new LockManager( dls, lockName, threadName);
+            return new LockManager(dls, lockName, threadName);
+        }
+
+        static public async Task<LockManager> MakeSureRunsOnOneMachine(Func<Task> Work, DistributedLockService dls, string lockName)
+        {
+            var prevFenceToken = 0;
+            var lockDuration = 20;
+            var threadName = "";
+
+            while (true)
+            {
+                using (var mutex = await LockManager.CreateLockAsync(dls, lockName, threadName))
+                {
+                    LeaseRequestStatus reqStatus = await mutex.AcquireLeaseAsync(lockDuration, prevFenceToken);
+
+                    var latestFenceToken = reqStatus.fenceToken;
+                    var newOwner = reqStatus.currentOwner;
+
+                    Console.WriteLine($"{mutex.Name}: Sees lock [{lockName}] having token {latestFenceToken}, attempting to acquire lease.");
+
+                    if (latestFenceToken <= prevFenceToken)
+                    {
+                        new Exception($"[{DateTime.Now}]: {mutex.Name} : Violation: {latestFenceToken} was acquired after {prevFenceToken} was seen");
+                    }
+
+                    if (latestFenceToken > 0 && newOwner == mutex.ownerId)
+                    {
+                        Console.WriteLine($"{mutex.Name}: Attempt to aquire lease on lock [{lockName}] using token {latestFenceToken}  ==> SUCESS");
+
+                        var tokenSource = new CancellationTokenSource();
+                        CancellationToken ct = tokenSource.Token;
+
+                        Task.Run(async () =>
+                        {
+                            while (!ct.IsCancellationRequested)
+                            {
+                                var ms = lockDuration * 1000;
+
+                                await Task.Delay(ms / 2, ct);
+                                await mutex.AcquireLeaseAsync(lockDuration, latestFenceToken);
+                                var bigText1 = new FigletText($"Renew lease")
+                                    .Centered()
+                                    .Color(Spectre.Console.Color.Green);
+
+                                // Render the big text to the console
+                                AnsiConsole.Write(bigText1);
+                            }
+
+                            var bigText = new FigletText($"Renew stopped")
+                                .Centered()
+                                .Color(Spectre.Console.Color.Yellow);
+
+                            // Render the big text to the console
+                            AnsiConsole.Write(bigText);
+                        }, tokenSource.Token);
+
+                        await Work();
+                        await tokenSource.CancelAsync();
+
+                        Console.WriteLine($"{mutex.Name}: Releasing the lock [{lockName}].");
+                        await mutex.ReleaseLeaseAsync();
+                    }
+                    else
+                    {
+                        Console.WriteLine($"{mutex.Name}: Attempt to acquire lease on lock [{lockName}] using token {latestFenceToken}  ==> FAILED");
+                    }
+                }
+
+                await Task.Delay(1000);
+            }
         }
 
         /// <summary>
@@ -88,8 +164,8 @@ namespace Cosmos_Patterns_GlobalLock
         public async Task<LeaseRequestStatus> AcquireLeaseAsync(int leaseDuration, long existingFenceToken)
         {
             try
-            {                
-                var reqStatus= await dls.AcquireLeaseAsync(lockName, ownerId, leaseDuration,existingFenceToken);
+            {
+                var reqStatus = await dls.AcquireLeaseAsync(lockName, ownerId, leaseDuration, existingFenceToken);
                 leaseOwnerId = reqStatus.currentOwner;
                 return reqStatus;
             }
@@ -102,8 +178,8 @@ namespace Cosmos_Patterns_GlobalLock
         public async Task<bool> ReleaseLeaseAsync()
         {
             try
-            {   
-                if(leaseOwnerId== ownerId)
+            {
+                if (leaseOwnerId == ownerId)
                     await dls.ReleaseLeaseAsync(ownerId);
 
                 return true;
@@ -141,8 +217,6 @@ namespace Cosmos_Patterns_GlobalLock
             }
         }
 
-
-
         public void Dispose()
         {
             Dispose(true);
@@ -153,10 +227,24 @@ namespace Cosmos_Patterns_GlobalLock
         {
             if (disposing)
             {
-                Task<bool> releaseTask= ReleaseLeaseAsync();
+                Task<bool> releaseTask = ReleaseLeaseAsync();
             }
+        }
 
+        public async Task StartLeaseRenewal(int leaseDuration)
+        {
+            while (!renewalTokenSource.IsCancellationRequested)
+            {
+                Console.WriteLine("Renewal", ConsoleColor.Yellow);
+
+                await Task.Delay(leaseDuration * 1000 - 5000, renewalTokenSource.Token);
+                await dls.AcquireLeaseAsync(lockName, ownerId, leaseDuration, 0);
+            }
+        }
+
+        public async Task StopLeaseRenewal()
+        {
+            await renewalTokenSource.CancelAsync();
         }
     }
-
 }
